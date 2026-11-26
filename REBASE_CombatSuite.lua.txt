@@ -1,0 +1,1655 @@
+--!nocheck
+-- REBASE Client Suite | Luau + Rayfield UI (Desktop & Mobile Touch Support)
+-- Features: Aimbot, Drawing/GUI FOV Circle, Velocity & Ping Auto-Prediction,
+--           Raycast Silent Aim (__namecall), Speed Walk, Desync, Anti-Aim, Touch HUD
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Stats = game:GetService("Stats")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- Clean up any previous instance before initializing
+local GlobalEnv = (typeof(getgenv) == "function" and getgenv()) or _G
+if typeof(GlobalEnv.__REBASE_COMBAT_UNLOAD) == "function" then
+    pcall(GlobalEnv.__REBASE_COMBAT_UNLOAD)
+end
+
+-- Probe executor API and platform capabilities before use
+local IsTouchDevice = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local HasTouchScreen = UserInputService.TouchEnabled
+
+local Capabilities = {
+    Drawing = typeof(Drawing) == "table" and typeof(Drawing.new) == "function",
+    HookMetamethod = typeof(hookmetamethod) == "function",
+    NewCClosure = typeof(newcclosure) == "function",
+    CheckCaller = typeof(checkcaller) == "function",
+    GetNamecallMethod = typeof(getnamecallmethod) == "function",
+    SetFFlag = typeof(setfflag) == "function",
+    GetHui = typeof(gethui) == "function",
+}
+
+local CanHookNamecall = Capabilities.HookMetamethod
+    and Capabilities.NewCClosure
+    and Capabilities.CheckCaller
+    and Capabilities.GetNamecallMethod
+
+-- Centralized runtime configuration (auto-tuned defaults for mobile vs desktop)
+local Config = {
+    Mobile = {
+        Enabled = HasTouchScreen,
+        ShowTouchHUD = HasTouchScreen,
+        TouchAimHoldMode = false, -- false = tap AIM button to toggle lock; true = hold AIM button
+        ButtonScale = 1.0,
+        ButtonTransparency = 0.2,
+        UseGuiFOVFallback = not Capabilities.Drawing,
+    },
+    Aimbot = {
+        Enabled = false,
+        ToggleMode = false,
+        Key = Enum.UserInputType.MouseButton2,
+        TargetPart = "Head",
+        Smoothness = 0.22,
+        TeamCheck = true,
+        WallCheck = true,
+        StickyTarget = true,
+    },
+    FOV = {
+        Enabled = true,
+        FollowMouse = not HasTouchScreen, -- Screen center on touch devices, cursor on desktop
+        Radius = IsTouchDevice and 120 or 140,
+        Thickness = 1.5,
+        NumSides = 64,
+        Filled = false,
+        Transparency = 0.85,
+        Color = Color3.fromRGB(0, 210, 255),
+    },
+    Prediction = {
+        Enabled = true,
+        AutoPrediction = true,
+        AutoScale = 1.0,
+        ManualHorizontal = 0.135,
+        ManualVertical = 0.115,
+        PingFloorMs = 20,
+        PingCeilMs = 250,
+    },
+    SilentAim = {
+        Enabled = false,
+        Method = "All Raycast", -- "Workspace:Raycast" | "FindPartOnRay" | "All Raycast"
+        HitChance = 100,
+        TargetPart = "Head",
+        UseFOV = true,
+        TeamCheck = true,
+        WallCheck = true,
+    },
+    SpeedWalk = {
+        Enabled = false,
+        Method = "CFrame", -- "CFrame" | "WalkSpeed"
+        Speed = 32,
+        DefaultWalkSpeed = 16,
+    },
+    Desync = {
+        Enabled = false,
+        Mode = "CFrame Blink", -- "CFrame Blink" | "Velocity Spoof" | "FFlag Replication"
+        OffsetRange = 6.0,
+        VerticalOffset = 0.0,
+        VelocityMagnitude = 180,
+    },
+    AntiAim = {
+        Enabled = false,
+        YawMode = "Spin", -- "Spin" | "Jitter" | "Backward" | "Random"
+        SpinSpeed = 25,
+        JitterAngle = 75,
+        PitchTilt = 0,
+    },
+}
+
+-- Runtime state tracking
+local State = {
+    Unloaded = false,
+    AimbotToggled = false,
+    TouchAimHeld = false,
+    LockedTarget = nil,
+    Connections = {},
+    FOVCircle = nil,
+    TouchGui = nil,
+    GuiFOVFrame = nil,
+    GuiFOVStroke = nil,
+    TouchButtons = {},
+    TouchHUDCollapsed = false,
+    SavedWalkSpeed = nil,
+    SavedAutoRotate = nil,
+    SpinAngle = 0,
+    JitterSign = 1,
+    DesyncActiveOffset = Vector3.zero,
+    SavedVelocity = nil,
+    FFlagModified = false,
+    NamecallHooked = false,
+}
+
+local function TrackConnection(conn: RBXScriptConnection): RBXScriptConnection
+    table.insert(State.Connections, conn)
+    return conn
+end
+
+local function IsFiniteNumber(n: any): boolean
+    return typeof(n) == "number" and n == n and math.abs(n) < math.huge
+end
+
+local function IsFiniteVector3(v: any): boolean
+    return typeof(v) == "Vector3"
+        and IsFiniteNumber(v.X)
+        and IsFiniteNumber(v.Y)
+        and IsFiniteNumber(v.Z)
+end
+
+local function GetSafeGuiParent(): Instance
+    if Capabilities.GetHui then
+        local ok, hui = pcall(gethui)
+        if ok and typeof(hui) == "Instance" then
+            return hui
+        end
+    end
+    local okCore, _ = pcall(function()
+        return CoreGui.Name
+    end)
+    if okCore then
+        return CoreGui
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- Character & entity validation helpers
+local function GetCharacterParts(character: Model?)
+    if not character then
+        return nil, nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local rootPart = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+    if not humanoid or not rootPart or humanoid.Health <= 0 then
+        return nil, nil
+    end
+    return humanoid, rootPart
+end
+
+local function ResolveTargetPart(character: Model, preferredName: string): BasePart?
+    local part = character:FindFirstChild(preferredName)
+    if part and part:IsA("BasePart") then
+        return part
+    end
+    local fallback = character:FindFirstChild("HumanoidRootPart")
+    if fallback and fallback:IsA("BasePart") then
+        return fallback
+    end
+    return nil
+end
+
+local function IsSameTeam(player: Player): boolean
+    if not LocalPlayer then
+        return false
+    end
+    if LocalPlayer.Team ~= nil and player.Team ~= nil then
+        return LocalPlayer.Team == player.Team
+    end
+    return false
+end
+
+local function IsPositionVisible(origin: Vector3, targetPos: Vector3, targetCharacter: Model): boolean
+    local direction = targetPos - origin
+    if direction.Magnitude <= 0.001 then
+        return true
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = {}
+    if LocalPlayer and LocalPlayer.Character then
+        table.insert(ignore, LocalPlayer.Character)
+    end
+    if Camera then
+        table.insert(ignore, Camera)
+    end
+    params.FilterDescendantsInstances = ignore
+    params.IgnoreWater = true
+
+    local result = Workspace:Raycast(origin, direction, params)
+    if not result or not result.Instance then
+        return true
+    end
+    return result.Instance:IsDescendantOf(targetCharacter)
+end
+
+-- Network latency & velocity prediction
+local function GetPingSeconds(): number
+    local ok, pingMs = pcall(function()
+        local network = Stats:FindFirstChild("Network")
+        local serverStats = network and network:FindFirstChild("ServerStatsItem")
+        local dataPing = serverStats and serverStats:FindFirstChild("Data Ping")
+        return dataPing and dataPing:GetValue() or 0
+    end)
+    if not ok or not IsFiniteNumber(pingMs) or pingMs <= 0 then
+        return 0.05
+    end
+    local clamped = math.clamp(pingMs, Config.Prediction.PingFloorMs, Config.Prediction.PingCeilMs)
+    return clamped / 1000
+end
+
+local function GetCurrentLeadFactors(): (number, number)
+    if not Config.Prediction.Enabled then
+        return 0, 0
+    end
+    if Config.Prediction.AutoPrediction then
+        local pingSec = GetPingSeconds()
+        local baseLead = (pingSec + (pingSec * pingSec * 0.35)) * Config.Prediction.AutoScale
+        return baseLead, baseLead * 0.75
+    end
+    return Config.Prediction.ManualHorizontal, Config.Prediction.ManualVertical
+end
+
+local function GetPredictedPosition(targetPart: BasePart, rootPart: BasePart): Vector3
+    local basePos = targetPart.Position
+    if not Config.Prediction.Enabled then
+        return basePos
+    end
+
+    local velocity = rootPart.AssemblyLinearVelocity
+    if not IsFiniteVector3(velocity) or velocity.Magnitude < 0.05 then
+        return basePos
+    end
+
+    local leadH, leadV = GetCurrentLeadFactors()
+    local predicted = basePos + Vector3.new(
+        velocity.X * leadH,
+        velocity.Y * leadV,
+        velocity.Z * leadH
+    )
+    if IsFiniteVector3(predicted) then
+        return predicted
+    end
+    return basePos
+end
+
+-- FOV origin & target selection
+local function GetFOVOrigin(): Vector2
+    if Config.FOV.FollowMouse and not IsTouchDevice then
+        return UserInputService:GetMouseLocation()
+    end
+    Camera = Workspace.CurrentCamera
+    if Camera then
+        return Camera.ViewportSize * 0.5
+    end
+    return Vector2.zero
+end
+
+local function ValidateSpecificTarget(
+    player: Player?,
+    partName: string,
+    useFOV: boolean,
+    teamCheck: boolean,
+    wallCheck: boolean
+): (BasePart?, BasePart?)
+    if not player or player == LocalPlayer or not player.Parent then
+        return nil, nil
+    end
+    if teamCheck and IsSameTeam(player) then
+        return nil, nil
+    end
+
+    local character = player.Character
+    if not character then
+        return nil, nil
+    end
+
+    local _, rootPart = GetCharacterParts(character)
+    if not rootPart then
+        return nil, nil
+    end
+
+    local targetPart = ResolveTargetPart(character, partName)
+    if not targetPart then
+        return nil, nil
+    end
+
+    Camera = Workspace.CurrentCamera
+    if not Camera then
+        return nil, nil
+    end
+
+    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+    if not onScreen or screenPos.Z <= 0 then
+        return nil, nil
+    end
+
+    if useFOV then
+        local fovOrigin = GetFOVOrigin()
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - fovOrigin).Magnitude
+        if dist > Config.FOV.Radius then
+            return nil, nil
+        end
+    end
+
+    if wallCheck and not IsPositionVisible(Camera.CFrame.Position, targetPart.Position, character) then
+        return nil, nil
+    end
+
+    return targetPart, rootPart
+end
+
+local function GetBestTarget(
+    partName: string,
+    useFOV: boolean,
+    teamCheck: boolean,
+    wallCheck: boolean
+): (Player?, BasePart?, BasePart?)
+    Camera = Workspace.CurrentCamera
+    if not Camera then
+        return nil, nil, nil
+    end
+
+    local fovOrigin = GetFOVOrigin()
+    local bestPlayer: Player? = nil
+    local bestPart: BasePart? = nil
+    local bestRoot: BasePart? = nil
+    local bestDistance = useFOV and Config.FOV.Radius or math.huge
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if not (teamCheck and IsSameTeam(player)) then
+                local character = player.Character
+                local _, rootPart = GetCharacterParts(character)
+                if character and rootPart then
+                    local targetPart = ResolveTargetPart(character, partName)
+                    if targetPart then
+                        local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                        if onScreen and screenPos.Z > 0 then
+                            local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - fovOrigin).Magnitude
+                            if screenDist <= bestDistance then
+                                if not wallCheck or IsPositionVisible(Camera.CFrame.Position, targetPart.Position, character) then
+                                    bestDistance = screenDist
+                                    bestPlayer = player
+                                    bestPart = targetPart
+                                    bestRoot = rootPart
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPlayer, bestPart, bestRoot
+end
+
+-- Drawing API FOV Circle initialization
+if Capabilities.Drawing then
+    local ok, circle = pcall(function()
+        local obj = Drawing.new("Circle")
+        obj.Visible = Config.FOV.Enabled and not Config.Mobile.UseGuiFOVFallback
+        obj.Radius = Config.FOV.Radius
+        obj.Thickness = Config.FOV.Thickness
+        obj.NumSides = Config.FOV.NumSides
+        obj.Filled = Config.FOV.Filled
+        obj.Transparency = Config.FOV.Transparency
+        obj.Color = Config.FOV.Color
+        obj.Position = GetFOVOrigin()
+        return obj
+    end)
+    if ok and circle then
+        State.FOVCircle = circle
+    else
+        Config.Mobile.UseGuiFOVFallback = true
+    end
+end
+
+-- Mobile Touch HUD & GUI FOV Fallback
+local function UpdateTouchHUDVisuals()
+    local activeColor = Color3.fromRGB(0, 175, 225)
+    local inactiveColor = Color3.fromRGB(28, 32, 42)
+    local alpha = math.clamp(Config.Mobile.ButtonTransparency, 0, 0.85)
+
+    local states = {
+        Aim = Config.Aimbot.Enabled and (State.AimbotToggled or State.TouchAimHeld),
+        Silent = Config.SilentAim.Enabled,
+        Speed = Config.SpeedWalk.Enabled,
+        Desync = Config.Desync.Enabled,
+    }
+
+    for key, btn in pairs(State.TouchButtons) do
+        if btn and btn:IsA("TextButton") then
+            local isOn = states[key] == true
+            btn.BackgroundColor3 = isOn and activeColor or inactiveColor
+            btn.BackgroundTransparency = isOn and math.max(0.05, alpha - 0.1) or alpha
+            btn.TextColor3 = isOn and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(210, 218, 230)
+        end
+    end
+end
+
+local function BuildMobileOverlay()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "REBASE_MobileHUD"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 999
+    gui.Parent = GetSafeGuiParent()
+    State.TouchGui = gui
+
+    -- GUI-based FOV Ring (used when Drawing API is unavailable or disabled on mobile)
+    local fovFrame = Instance.new("Frame")
+    fovFrame.Name = "GuiFOVCircle"
+    fovFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    fovFrame.Position = UDim2.fromOffset(0, 0)
+    fovFrame.Size = UDim2.fromOffset(Config.FOV.Radius * 2, Config.FOV.Radius * 2)
+    fovFrame.BackgroundColor3 = Config.FOV.Color
+    fovFrame.BackgroundTransparency = 1
+    fovFrame.BorderSizePixel = 0
+    fovFrame.Visible = false
+    fovFrame.ZIndex = 1
+    fovFrame.Parent = gui
+
+    local fovCorner = Instance.new("UICorner")
+    fovCorner.CornerRadius = UDim.new(1, 0)
+    fovCorner.Parent = fovFrame
+
+    local fovStroke = Instance.new("UIStroke")
+    fovStroke.Thickness = Config.FOV.Thickness
+    fovStroke.Color = Config.FOV.Color
+    fovStroke.Transparency = 1 - Config.FOV.Transparency
+    fovStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    fovStroke.Parent = fovFrame
+
+    State.GuiFOVFrame = fovFrame
+    State.GuiFOVStroke = fovStroke
+
+    -- Draggable Touch Quick-Action Bar
+    local bar = Instance.new("Frame")
+    bar.Name = "TouchActionBar"
+    bar.AnchorPoint = Vector2.new(0.5, 0)
+    bar.Position = UDim2.new(0.5, 0, 0, 52)
+    bar.AutomaticSize = Enum.AutomaticSize.X
+    bar.Size = UDim2.fromOffset(0, 46)
+    bar.BackgroundColor3 = Color3.fromRGB(18, 21, 28)
+    bar.BackgroundTransparency = 0.25
+    bar.BorderSizePixel = 0
+    bar.Visible = Config.Mobile.ShowTouchHUD
+    bar.ZIndex = 10
+    bar.Parent = gui
+
+    local barScale = Instance.new("UIScale")
+    barScale.Name = "HUDScale"
+    barScale.Scale = Config.Mobile.ButtonScale
+    barScale.Parent = bar
+
+    local barCorner = Instance.new("UICorner")
+    barCorner.CornerRadius = UDim.new(0, 12)
+    barCorner.Parent = bar
+
+    local barStroke = Instance.new("UIStroke")
+    barStroke.Thickness = 1.2
+    barStroke.Color = Color3.fromRGB(60, 70, 90)
+    barStroke.Transparency = 0.35
+    barStroke.Parent = bar
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 6)
+    padding.PaddingRight = UDim.new(0, 6)
+    padding.PaddingTop = UDim.new(0, 5)
+    padding.PaddingBottom = UDim.new(0, 5)
+    padding.Parent = bar
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Horizontal
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.VerticalAlignment = Enum.VerticalAlignment.Center
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = bar
+
+    -- Drag handle (supports both Touch and Mouse without blocking camera drag elsewhere)
+    local dragHandle = Instance.new("TextButton")
+    dragHandle.Name = "DragHandle"
+    dragHandle.Size = UDim2.fromOffset(34, 36)
+    dragHandle.BackgroundColor3 = Color3.fromRGB(36, 42, 54)
+    dragHandle.BackgroundTransparency = 0.2
+    dragHandle.Text = "::"
+    dragHandle.Font = Enum.Font.GothamBold
+    dragHandle.TextSize = 14
+    dragHandle.TextColor3 = Color3.fromRGB(160, 175, 195)
+    dragHandle.AutoButtonColor = false
+    dragHandle.Parent = bar
+
+    local dragCorner = Instance.new("UICorner")
+    dragCorner.CornerRadius = UDim.new(0, 8)
+    dragCorner.Parent = dragHandle
+
+    local dragging = false
+    local dragStart = Vector2.zero
+    local startPos = bar.Position
+
+    TrackConnection(dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = Vector2.new(input.Position.X, input.Position.Y)
+            startPos = bar.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end))
+
+    TrackConnection(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+            bar.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+
+    local function MakeActionButton(id: string, label: string, width: number): TextButton
+        local btn = Instance.new("TextButton")
+        btn.Name = id .. "Btn"
+        btn.Size = UDim2.fromOffset(width, 36)
+        btn.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+        btn.BackgroundTransparency = Config.Mobile.ButtonTransparency
+        btn.Text = label
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 12
+        btn.TextColor3 = Color3.fromRGB(210, 218, 230)
+        btn.AutoButtonColor = false
+        btn.Parent = bar
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = btn
+
+        State.TouchButtons[id] = btn
+        return btn
+    end
+
+    local aimBtn = MakeActionButton("Aim", "AIM", 54)
+    local silentBtn = MakeActionButton("Silent", "SILENT", 62)
+    local speedBtn = MakeActionButton("Speed", "SPEED", 58)
+    local desyncBtn = MakeActionButton("Desync", "DESYNC", 64)
+
+    -- Collapse / Expand button so mobile players can tuck the bar away mid-fight
+    local collapseBtn = Instance.new("TextButton")
+    collapseBtn.Name = "CollapseBtn"
+    collapseBtn.Size = UDim2.fromOffset(32, 36)
+    collapseBtn.BackgroundColor3 = Color3.fromRGB(36, 42, 54)
+    collapseBtn.BackgroundTransparency = 0.2
+    collapseBtn.Text = "-"
+    collapseBtn.Font = Enum.Font.GothamBold
+    collapseBtn.TextSize = 15
+    collapseBtn.TextColor3 = Color3.fromRGB(200, 210, 225)
+    collapseBtn.AutoButtonColor = false
+    collapseBtn.Parent = bar
+
+    local colCorner = Instance.new("UICorner")
+    colCorner.CornerRadius = UDim.new(0, 8)
+    colCorner.Parent = collapseBtn
+
+    TrackConnection(collapseBtn.Activated:Connect(function()
+        State.TouchHUDCollapsed = not State.TouchHUDCollapsed
+        collapseBtn.Text = State.TouchHUDCollapsed and "+" or "-"
+        aimBtn.Visible = not State.TouchHUDCollapsed
+        silentBtn.Visible = not State.TouchHUDCollapsed
+        speedBtn.Visible = not State.TouchHUDCollapsed
+        desyncBtn.Visible = not State.TouchHUDCollapsed
+    end))
+
+    -- AIM button supports both Hold mode and Tap-Toggle mode
+    TrackConnection(aimBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if not Config.Aimbot.Enabled then
+                Config.Aimbot.Enabled = true
+            end
+            if Config.Mobile.TouchAimHoldMode then
+                State.TouchAimHeld = true
+            else
+                State.AimbotToggled = not State.AimbotToggled
+                if not State.AimbotToggled then
+                    State.LockedTarget = nil
+                end
+            end
+            UpdateTouchHUDVisuals()
+        end
+    end))
+
+    TrackConnection(aimBtn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if Config.Mobile.TouchAimHoldMode then
+                State.TouchAimHeld = false
+                State.LockedTarget = nil
+                UpdateTouchHUDVisuals()
+            end
+        end
+    end))
+
+    TrackConnection(silentBtn.Activated:Connect(function()
+        if CanHookNamecall then
+            Config.SilentAim.Enabled = not Config.SilentAim.Enabled
+            UpdateTouchHUDVisuals()
+        end
+    end))
+
+    TrackConnection(speedBtn.Activated:Connect(function()
+        Config.SpeedWalk.Enabled = not Config.SpeedWalk.Enabled
+        UpdateTouchHUDVisuals()
+    end))
+
+    TrackConnection(desyncBtn.Activated:Connect(function()
+        Config.Desync.Enabled = not Config.Desync.Enabled
+        UpdateTouchHUDVisuals()
+    end))
+
+    UpdateTouchHUDVisuals()
+end
+
+BuildMobileOverlay()
+
+-- Silent Aim Raycast Metamethod Hook (__namecall)
+local function InstallSilentAimHook()
+    if not CanHookNamecall or State.NamecallHooked then
+        return
+    end
+
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        if State.Unloaded or checkcaller() or not Config.SilentAim.Enabled then
+            return oldNamecall(self, ...)
+        end
+
+        if self == Workspace then
+            local method = getnamecallmethod()
+            local selectedMode = Config.SilentAim.Method
+
+            local handleModern = (method == "Raycast")
+                and (selectedMode == "Workspace:Raycast" or selectedMode == "All Raycast")
+            local handleLegacy = (
+                method == "FindPartOnRay"
+                or method == "FindPartOnRayWithIgnoreList"
+                or method == "FindPartOnRayWithWhitelist"
+            ) and (selectedMode == "FindPartOnRay" or selectedMode == "All Raycast")
+
+            if (handleModern or handleLegacy) and math.random(1, 100) <= Config.SilentAim.HitChance then
+                local args = { ... }
+
+                if handleModern then
+                    local origin = args[1]
+                    local direction = args[2]
+                    if IsFiniteVector3(origin) and IsFiniteVector3(direction) and direction.Magnitude > 0.001 then
+                        local ok, _, targetPart, targetRoot = pcall(
+                            GetBestTarget,
+                            Config.SilentAim.TargetPart,
+                            Config.SilentAim.UseFOV,
+                            Config.SilentAim.TeamCheck,
+                            Config.SilentAim.WallCheck
+                        )
+                        if ok and targetPart and targetRoot then
+                            local predictedPos = GetPredictedPosition(targetPart, targetRoot)
+                            local delta = predictedPos - origin
+                            if delta.Magnitude > 0.001 then
+                                args[2] = delta.Unit * direction.Magnitude
+                                return oldNamecall(self, table.unpack(args))
+                            end
+                        end
+                    end
+                elseif handleLegacy then
+                    local ray = args[1]
+                    if typeof(ray) == "Ray" and ray.Direction.Magnitude > 0.001 then
+                        local ok, _, targetPart, targetRoot = pcall(
+                            GetBestTarget,
+                            Config.SilentAim.TargetPart,
+                            Config.SilentAim.UseFOV,
+                            Config.SilentAim.TeamCheck,
+                            Config.SilentAim.WallCheck
+                        )
+                        if ok and targetPart and targetRoot then
+                            local predictedPos = GetPredictedPosition(targetPart, targetRoot)
+                            local delta = predictedPos - ray.Origin
+                            if delta.Magnitude > 0.001 then
+                                args[1] = Ray.new(ray.Origin, delta.Unit * ray.Direction.Magnitude)
+                                return oldNamecall(self, table.unpack(args))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        return oldNamecall(self, ...)
+    end))
+
+    State.NamecallHooked = true
+end
+
+InstallSilentAimHook()
+
+-- Aimbot activation check (supports desktop hold/toggle AND mobile touch button)
+local function IsAimbotActive(): boolean
+    if not Config.Aimbot.Enabled then
+        return false
+    end
+    if Config.Mobile.Enabled then
+        if Config.Mobile.TouchAimHoldMode and State.TouchAimHeld then
+            return true
+        end
+        if not Config.Mobile.TouchAimHoldMode and State.AimbotToggled then
+            return true
+        end
+    end
+    if Config.Aimbot.ToggleMode then
+        return State.AimbotToggled
+    end
+    local key = Config.Aimbot.Key
+    if typeof(key) == "EnumItem" then
+        if key.EnumType == Enum.UserInputType then
+            return UserInputService:IsMouseButtonPressed(key :: Enum.UserInputType)
+        elseif key.EnumType == Enum.KeyCode then
+            return UserInputService:IsKeyDown(key :: Enum.KeyCode)
+        end
+    end
+    return false
+end
+
+TrackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or State.Unloaded then
+        return
+    end
+    if Config.Aimbot.Enabled and Config.Aimbot.ToggleMode then
+        if input.UserInputType == Config.Aimbot.Key or input.KeyCode == Config.Aimbot.Key then
+            State.AimbotToggled = not State.AimbotToggled
+            if not State.AimbotToggled then
+                State.LockedTarget = nil
+            end
+            UpdateTouchHUDVisuals()
+        end
+    end
+end))
+
+-- Restore helpers for clean disable/unload
+local function RestoreCharacterState()
+    local character = LocalPlayer and LocalPlayer.Character
+    local humanoid, rootPart = GetCharacterParts(character)
+
+    if humanoid then
+        if State.SavedWalkSpeed ~= nil then
+            humanoid.WalkSpeed = State.SavedWalkSpeed
+            State.SavedWalkSpeed = nil
+        end
+        if State.SavedAutoRotate ~= nil then
+            humanoid.AutoRotate = State.SavedAutoRotate
+            State.SavedAutoRotate = nil
+        end
+    end
+
+    if rootPart then
+        if State.DesyncActiveOffset.Magnitude > 0 then
+            rootPart.CFrame = rootPart.CFrame - State.DesyncActiveOffset
+            State.DesyncActiveOffset = Vector3.zero
+        end
+        if State.SavedVelocity ~= nil then
+            rootPart.AssemblyLinearVelocity = State.SavedVelocity
+            State.SavedVelocity = nil
+        end
+        local rootJoint = rootPart:FindFirstChild("RootJoint")
+        if rootJoint and rootJoint:IsA("Motor6D") then
+            rootJoint.Transform = CFrame.new()
+        end
+    end
+
+    if State.FFlagModified and Capabilities.SetFFlag then
+        pcall(setfflag, "NextGenReplicatorEnabledWrite4", "false")
+        State.FFlagModified = false
+    end
+end
+
+-- Pre-render step: restore desynced local visual transform, update FOV circle & Aimbot
+TrackConnection(RunService.RenderStepped:Connect(function(dt: number)
+    if State.Unloaded then
+        return
+    end
+
+    Camera = Workspace.CurrentCamera
+    local character = LocalPlayer and LocalPlayer.Character
+    local _, rootPart = GetCharacterParts(character)
+
+    if rootPart then
+        if State.DesyncActiveOffset.Magnitude > 0 then
+            rootPart.CFrame = rootPart.CFrame - State.DesyncActiveOffset
+            State.DesyncActiveOffset = Vector3.zero
+        end
+        if State.SavedVelocity ~= nil then
+            rootPart.AssemblyLinearVelocity = State.SavedVelocity
+            State.SavedVelocity = nil
+        end
+    end
+
+    -- Update FOV Circle (Drawing API or Mobile GUI Fallback)
+    local fovOrigin = GetFOVOrigin()
+    local useGuiFOV = Config.Mobile.UseGuiFOVFallback or not State.FOVCircle
+
+    if State.FOVCircle then
+        local showDrawing = Config.FOV.Enabled and not useGuiFOV
+        State.FOVCircle.Visible = showDrawing
+        if showDrawing then
+            State.FOVCircle.Position = fovOrigin
+            State.FOVCircle.Radius = Config.FOV.Radius
+            State.FOVCircle.Thickness = Config.FOV.Thickness
+            State.FOVCircle.Filled = Config.FOV.Filled
+            State.FOVCircle.Transparency = Config.FOV.Transparency
+            State.FOVCircle.Color = Config.FOV.Color
+        end
+    end
+
+    if State.GuiFOVFrame and State.GuiFOVStroke then
+        local showGui = Config.FOV.Enabled and useGuiFOV
+        State.GuiFOVFrame.Visible = showGui
+        if showGui then
+            local diameter = Config.FOV.Radius * 2
+            State.GuiFOVFrame.Position = UDim2.fromOffset(fovOrigin.X, fovOrigin.Y)
+            State.GuiFOVFrame.Size = UDim2.fromOffset(diameter, diameter)
+            State.GuiFOVFrame.BackgroundColor3 = Config.FOV.Color
+            State.GuiFOVFrame.BackgroundTransparency = Config.FOV.Filled and (1 - Config.FOV.Transparency) or 1
+            State.GuiFOVStroke.Thickness = Config.FOV.Thickness
+            State.GuiFOVStroke.Color = Config.FOV.Color
+            State.GuiFOVStroke.Transparency = 1 - Config.FOV.Transparency
+        end
+    end
+
+    -- Execute Camera Aimbot
+    if IsAimbotActive() and Camera then
+        local targetPart: BasePart? = nil
+        local targetRoot: BasePart? = nil
+
+        if Config.Aimbot.StickyTarget and State.LockedTarget then
+            targetPart, targetRoot = ValidateSpecificTarget(
+                State.LockedTarget,
+                Config.Aimbot.TargetPart,
+                Config.FOV.Enabled,
+                Config.Aimbot.TeamCheck,
+                Config.Aimbot.WallCheck
+            )
+            if not targetPart then
+                State.LockedTarget = nil
+            end
+        end
+
+        if not targetPart then
+            local foundPlayer, foundPart, foundRoot = GetBestTarget(
+                Config.Aimbot.TargetPart,
+                Config.FOV.Enabled,
+                Config.Aimbot.TeamCheck,
+                Config.Aimbot.WallCheck
+            )
+            State.LockedTarget = foundPlayer
+            targetPart = foundPart
+            targetRoot = foundRoot
+        end
+
+        if targetPart and targetRoot then
+            local predictedPos = GetPredictedPosition(targetPart, targetRoot)
+            local camPos = Camera.CFrame.Position
+            if (predictedPos - camPos).Magnitude > 0.01 then
+                local goalCFrame = CFrame.lookAt(camPos, predictedPos)
+                local alpha = 1 - math.pow(1 - math.clamp(Config.Aimbot.Smoothness, 0.02, 1), math.clamp(dt * 60, 0.01, 4))
+                Camera.CFrame = Camera.CFrame:Lerp(goalCFrame, alpha)
+            end
+        end
+    else
+        State.LockedTarget = nil
+    end
+end))
+
+-- Post-physics Heartbeat step: Speed Walk, Anti-Aim, and Replication Desync
+TrackConnection(RunService.Heartbeat:Connect(function(dt: number)
+    if State.Unloaded then
+        return
+    end
+
+    local character = LocalPlayer and LocalPlayer.Character
+    local humanoid, rootPart = GetCharacterParts(character)
+    if not humanoid or not rootPart then
+        State.DesyncActiveOffset = Vector3.zero
+        State.SavedVelocity = nil
+        return
+    end
+
+    -- 1. Speed Walk
+    if Config.SpeedWalk.Enabled then
+        if Config.SpeedWalk.Method == "WalkSpeed" then
+            if State.SavedWalkSpeed == nil then
+                State.SavedWalkSpeed = humanoid.WalkSpeed
+            end
+            humanoid.WalkSpeed = Config.SpeedWalk.Speed
+        else
+            if State.SavedWalkSpeed ~= nil then
+                humanoid.WalkSpeed = State.SavedWalkSpeed
+                State.SavedWalkSpeed = nil
+            end
+            local moveDir = humanoid.MoveDirection
+            local extraSpeed = Config.SpeedWalk.Speed - Config.SpeedWalk.DefaultWalkSpeed
+            if moveDir.Magnitude > 0.01 and extraSpeed ~= 0 then
+                rootPart.CFrame = rootPart.CFrame + (moveDir.Unit * extraSpeed * dt)
+            end
+        end
+    elseif State.SavedWalkSpeed ~= nil then
+        humanoid.WalkSpeed = State.SavedWalkSpeed
+        State.SavedWalkSpeed = nil
+    end
+
+    -- 2. Anti-Aim
+    if Config.AntiAim.Enabled then
+        if State.SavedAutoRotate == nil then
+            State.SavedAutoRotate = humanoid.AutoRotate
+        end
+        humanoid.AutoRotate = false
+
+        Camera = Workspace.CurrentCamera
+        local baseYaw = 0
+        if Camera then
+            local look = Camera.CFrame.LookVector
+            baseYaw = math.atan2(-look.X, -look.Z)
+        end
+
+        local offsetYaw = 0
+        local mode = Config.AntiAim.YawMode
+        if mode == "Spin" then
+            State.SpinAngle = (State.SpinAngle + math.rad(Config.AntiAim.SpinSpeed * 30) * dt) % (math.pi * 2)
+            offsetYaw = State.SpinAngle
+        elseif mode == "Jitter" then
+            State.JitterSign = -State.JitterSign
+            offsetYaw = math.rad(Config.AntiAim.JitterAngle) * State.JitterSign
+        elseif mode == "Backward" then
+            offsetYaw = math.pi
+        elseif mode == "Random" then
+            offsetYaw = math.rad(math.random(-180, 180))
+        end
+
+        local pos = rootPart.Position
+        rootPart.CFrame = CFrame.new(pos) * CFrame.Angles(0, baseYaw + offsetYaw, 0)
+
+        local rootJoint = rootPart:FindFirstChild("RootJoint")
+        if rootJoint and rootJoint:IsA("Motor6D") then
+            if Config.AntiAim.PitchTilt ~= 0 then
+                rootJoint.Transform = CFrame.Angles(math.rad(Config.AntiAim.PitchTilt), 0, 0)
+            else
+                rootJoint.Transform = CFrame.new()
+            end
+        end
+    elseif State.SavedAutoRotate ~= nil then
+        humanoid.AutoRotate = State.SavedAutoRotate
+        State.SavedAutoRotate = nil
+        local rootJoint = rootPart:FindFirstChild("RootJoint")
+        if rootJoint and rootJoint:IsA("Motor6D") then
+            rootJoint.Transform = CFrame.new()
+        end
+    end
+
+    -- 3. Desync
+    if Config.Desync.Enabled then
+        local desyncMode = Config.Desync.Mode
+        if desyncMode == "CFrame Blink" then
+            if State.FFlagModified and Capabilities.SetFFlag then
+                pcall(setfflag, "NextGenReplicatorEnabledWrite4", "false")
+                State.FFlagModified = false
+            end
+            local range = Config.Desync.OffsetRange
+            local ox = (math.random() * 2 - 1) * range
+            local oz = (math.random() * 2 - 1) * range
+            local offset = Vector3.new(ox, Config.Desync.VerticalOffset, oz)
+            rootPart.CFrame = rootPart.CFrame + offset
+            State.DesyncActiveOffset = offset
+        elseif desyncMode == "Velocity Spoof" then
+            if State.FFlagModified and Capabilities.SetFFlag then
+                pcall(setfflag, "NextGenReplicatorEnabledWrite4", "false")
+                State.FFlagModified = false
+            end
+            State.SavedVelocity = rootPart.AssemblyLinearVelocity
+            local mag = Config.Desync.VelocityMagnitude
+            rootPart.AssemblyLinearVelocity = Vector3.new(
+                (math.random() * 2 - 1) * mag,
+                State.SavedVelocity.Y,
+                (math.random() * 2 - 1) * mag
+            )
+        elseif desyncMode == "FFlag Replication" and Capabilities.SetFFlag then
+            local flagVal = (math.floor(os.clock() * 20) % 2 == 0) and "true" or "false"
+            pcall(setfflag, "NextGenReplicatorEnabledWrite4", flagVal)
+            State.FFlagModified = true
+        end
+    else
+        if State.FFlagModified and Capabilities.SetFFlag then
+            pcall(setfflag, "NextGenReplicatorEnabledWrite4", "false")
+            State.FFlagModified = false
+        end
+    end
+end))
+
+-- Unified unload / teardown routine
+local function UnloadSuite()
+    if State.Unloaded then
+        return
+    end
+    State.Unloaded = true
+    Config.Aimbot.Enabled = false
+    Config.SilentAim.Enabled = false
+    Config.SpeedWalk.Enabled = false
+    Config.Desync.Enabled = false
+    Config.AntiAim.Enabled = false
+    State.TouchAimHeld = false
+
+    for _, conn in ipairs(State.Connections) do
+        if conn.Connected then
+            conn:Disconnect()
+        end
+    end
+    table.clear(State.Connections)
+
+    if State.FOVCircle then
+        pcall(function()
+            State.FOVCircle:Remove()
+        end)
+        State.FOVCircle = nil
+    end
+
+    if State.TouchGui then
+        pcall(function()
+            State.TouchGui:Destroy()
+        end)
+        State.TouchGui = nil
+    end
+
+    RestoreCharacterState()
+end
+
+GlobalEnv.__REBASE_COMBAT_UNLOAD = UnloadSuite
+
+-- Load Rayfield UI Library
+local okRayfield, Rayfield = pcall(function()
+    return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+end)
+
+if not okRayfield or not Rayfield then
+    warn("[REBASE] Failed to load Rayfield UI from https://sirius.menu/rayfield")
+    UnloadSuite()
+    return
+end
+
+local Window = Rayfield:CreateWindow({
+    Name = "REBASE | Luau Combat & Movement",
+    LoadingTitle = "REBASE Suite",
+    LoadingSubtitle = IsTouchDevice and "Mobile & Touch Edition" or "Desktop & Mobile Edition",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "REBASE_LuauSuite",
+        FileName = "CombatConfig",
+    },
+    KeySystem = false,
+})
+
+-- Tab 1: Aimbot & FOV
+local AimbotTab = Window:CreateTab("Aimbot", 4483362458)
+
+AimbotTab:CreateSection("Camera Aimbot")
+
+AimbotTab:CreateToggle({
+    Name = "Enable Aimbot",
+    CurrentValue = Config.Aimbot.Enabled,
+    Flag = "AimbotEnabled",
+    Callback = function(val)
+        Config.Aimbot.Enabled = val
+        if not val then
+            State.AimbotToggled = false
+            State.TouchAimHeld = false
+            State.LockedTarget = nil
+        end
+        UpdateTouchHUDVisuals()
+    end,
+})
+
+AimbotTab:CreateToggle({
+    Name = "Toggle Mode (Off = Hold)",
+    CurrentValue = Config.Aimbot.ToggleMode,
+    Flag = "AimbotToggleMode",
+    Callback = function(val)
+        Config.Aimbot.ToggleMode = val
+        State.AimbotToggled = false
+        UpdateTouchHUDVisuals()
+    end,
+})
+
+AimbotTab:CreateKeybind({
+    Name = "Desktop Activation Key",
+    CurrentKeybind = "MB2",
+    HoldToInteract = false,
+    Flag = "AimbotKeybind",
+    Callback = function(keyName)
+        if keyName == "MB1" then
+            Config.Aimbot.Key = Enum.UserInputType.MouseButton1
+        elseif keyName == "MB2" then
+            Config.Aimbot.Key = Enum.UserInputType.MouseButton2
+        elseif Enum.KeyCode[keyName] then
+            Config.Aimbot.Key = Enum.KeyCode[keyName]
+        end
+    end,
+})
+
+AimbotTab:CreateDropdown({
+    Name = "Target Part",
+    Options = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" },
+    CurrentOption = { Config.Aimbot.TargetPart },
+    MultipleOptions = false,
+    Flag = "AimbotTargetPart",
+    Callback = function(options)
+        Config.Aimbot.TargetPart = options[1] or "Head"
+    end,
+})
+
+AimbotTab:CreateSlider({
+    Name = "Smoothness",
+    Range = { 0.02, 1.0 },
+    Increment = 0.02,
+    Suffix = "",
+    CurrentValue = Config.Aimbot.Smoothness,
+    Flag = "AimbotSmoothness",
+    Callback = function(val)
+        Config.Aimbot.Smoothness = val
+    end,
+})
+
+AimbotTab:CreateToggle({
+    Name = "Sticky Target",
+    CurrentValue = Config.Aimbot.StickyTarget,
+    Flag = "AimbotSticky",
+    Callback = function(val)
+        Config.Aimbot.StickyTarget = val
+    end,
+})
+
+AimbotTab:CreateToggle({
+    Name = "Team Check",
+    CurrentValue = Config.Aimbot.TeamCheck,
+    Flag = "AimbotTeamCheck",
+    Callback = function(val)
+        Config.Aimbot.TeamCheck = val
+    end,
+})
+
+AimbotTab:CreateToggle({
+    Name = "Wall Check",
+    CurrentValue = Config.Aimbot.WallCheck,
+    Flag = "AimbotWallCheck",
+    Callback = function(val)
+        Config.Aimbot.WallCheck = val
+    end,
+})
+
+AimbotTab:CreateSection("FOV Circle")
+
+AimbotTab:CreateToggle({
+    Name = "Show FOV Circle",
+    CurrentValue = Config.FOV.Enabled,
+    Flag = "FOVEnabled",
+    Callback = function(val)
+        Config.FOV.Enabled = val
+    end,
+})
+
+AimbotTab:CreateToggle({
+    Name = "Follow Cursor (Desktop Only)",
+    CurrentValue = Config.FOV.FollowMouse,
+    Flag = "FOVFollowMouse",
+    Callback = function(val)
+        Config.FOV.FollowMouse = val
+    end,
+})
+
+AimbotTab:CreateSlider({
+    Name = "FOV Radius",
+    Range = { 20, 600 },
+    Increment = 5,
+    Suffix = "px",
+    CurrentValue = Config.FOV.Radius,
+    Flag = "FOVRadius",
+    Callback = function(val)
+        Config.FOV.Radius = val
+    end,
+})
+
+AimbotTab:CreateSlider({
+    Name = "Circle Thickness",
+    Range = { 1, 5 },
+    Increment = 0.5,
+    Suffix = "px",
+    CurrentValue = Config.FOV.Thickness,
+    Flag = "FOVThickness",
+    Callback = function(val)
+        Config.FOV.Thickness = val
+    end,
+})
+
+AimbotTab:CreateToggle({
+    Name = "Filled Circle",
+    CurrentValue = Config.FOV.Filled,
+    Flag = "FOVFilled",
+    Callback = function(val)
+        Config.FOV.Filled = val
+    end,
+})
+
+AimbotTab:CreateColorPicker({
+    Name = "FOV Color",
+    Color = Config.FOV.Color,
+    Flag = "FOVColor",
+    Callback = function(color)
+        Config.FOV.Color = color
+    end,
+})
+
+-- Tab 2: Silent Aim & Velocity Prediction
+local SilentTab = Window:CreateTab("Silent Aim & Pred", 4483362458)
+
+SilentTab:CreateSection("Silent Aim (Raycast Hook)")
+
+SilentTab:CreateToggle({
+    Name = "Enable Silent Aim",
+    CurrentValue = Config.SilentAim.Enabled,
+    Flag = "SilentAimEnabled",
+    Callback = function(val)
+        if val and not CanHookNamecall then
+            Rayfield:Notify({
+                Title = "Hook Unavailable",
+                Content = "Executor lacks hookmetamethod/newcclosure.",
+                Duration = 4,
+            })
+            return
+        end
+        Config.SilentAim.Enabled = val
+        UpdateTouchHUDVisuals()
+    end,
+})
+
+SilentTab:CreateDropdown({
+    Name = "Raycast Method",
+    Options = { "All Raycast", "Workspace:Raycast", "FindPartOnRay" },
+    CurrentOption = { Config.SilentAim.Method },
+    MultipleOptions = false,
+    Flag = "SilentAimMethod",
+    Callback = function(options)
+        Config.SilentAim.Method = options[1] or "All Raycast"
+    end,
+})
+
+SilentTab:CreateSlider({
+    Name = "Hit Chance",
+    Range = { 1, 100 },
+    Increment = 1,
+    Suffix = "%",
+    CurrentValue = Config.SilentAim.HitChance,
+    Flag = "SilentAimHitChance",
+    Callback = function(val)
+        Config.SilentAim.HitChance = val
+    end,
+})
+
+SilentTab:CreateDropdown({
+    Name = "Silent Target Part",
+    Options = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" },
+    CurrentOption = { Config.SilentAim.TargetPart },
+    MultipleOptions = false,
+    Flag = "SilentAimTargetPart",
+    Callback = function(options)
+        Config.SilentAim.TargetPart = options[1] or "Head"
+    end,
+})
+
+SilentTab:CreateToggle({
+    Name = "Restrict to FOV Circle",
+    CurrentValue = Config.SilentAim.UseFOV,
+    Flag = "SilentAimUseFOV",
+    Callback = function(val)
+        Config.SilentAim.UseFOV = val
+    end,
+})
+
+SilentTab:CreateToggle({
+    Name = "Team Check",
+    CurrentValue = Config.SilentAim.TeamCheck,
+    Flag = "SilentAimTeamCheck",
+    Callback = function(val)
+        Config.SilentAim.TeamCheck = val
+    end,
+})
+
+SilentTab:CreateToggle({
+    Name = "Wall Check",
+    CurrentValue = Config.SilentAim.WallCheck,
+    Flag = "SilentAimWallCheck",
+    Callback = function(val)
+        Config.SilentAim.WallCheck = val
+    end,
+})
+
+SilentTab:CreateSection("Velocity & Auto-Prediction")
+
+SilentTab:CreateToggle({
+    Name = "Enable Velocity Prediction",
+    CurrentValue = Config.Prediction.Enabled,
+    Flag = "PredictionEnabled",
+    Callback = function(val)
+        Config.Prediction.Enabled = val
+    end,
+})
+
+SilentTab:CreateToggle({
+    Name = "Auto-Prediction (Ping Adaptive)",
+    CurrentValue = Config.Prediction.AutoPrediction,
+    Flag = "AutoPredictionEnabled",
+    Callback = function(val)
+        Config.Prediction.AutoPrediction = val
+    end,
+})
+
+SilentTab:CreateSlider({
+    Name = "Auto-Prediction Scale",
+    Range = { 0.2, 2.5 },
+    Increment = 0.05,
+    Suffix = "x",
+    CurrentValue = Config.Prediction.AutoScale,
+    Flag = "AutoPredictionScale",
+    Callback = function(val)
+        Config.Prediction.AutoScale = val
+    end,
+})
+
+SilentTab:CreateSlider({
+    Name = "Manual Horizontal Prediction",
+    Range = { 0.0, 0.5 },
+    Increment = 0.005,
+    Suffix = "s",
+    CurrentValue = Config.Prediction.ManualHorizontal,
+    Flag = "ManualPredH",
+    Callback = function(val)
+        Config.Prediction.ManualHorizontal = val
+    end,
+})
+
+SilentTab:CreateSlider({
+    Name = "Manual Vertical Prediction",
+    Range = { 0.0, 0.5 },
+    Increment = 0.005,
+    Suffix = "s",
+    CurrentValue = Config.Prediction.ManualVertical,
+    Flag = "ManualPredV",
+    Callback = function(val)
+        Config.Prediction.ManualVertical = val
+    end,
+})
+
+-- Tab 3: Speed Walk & Anti-Aim
+local MovementTab = Window:CreateTab("Speed & Anti-Aim", 4483362458)
+
+MovementTab:CreateSection("Speed Walk")
+
+MovementTab:CreateToggle({
+    Name = "Enable Speed Walk",
+    CurrentValue = Config.SpeedWalk.Enabled,
+    Flag = "SpeedWalkEnabled",
+    Callback = function(val)
+        Config.SpeedWalk.Enabled = val
+        UpdateTouchHUDVisuals()
+    end,
+})
+
+MovementTab:CreateDropdown({
+    Name = "Speed Method",
+    Options = { "CFrame", "WalkSpeed" },
+    CurrentOption = { Config.SpeedWalk.Method },
+    MultipleOptions = false,
+    Flag = "SpeedWalkMethod",
+    Callback = function(options)
+        Config.SpeedWalk.Method = options[1] or "CFrame"
+    end,
+})
+
+MovementTab:CreateSlider({
+    Name = "Move Speed",
+    Range = { 16, 150 },
+    Increment = 1,
+    Suffix = " st/s",
+    CurrentValue = Config.SpeedWalk.Speed,
+    Flag = "SpeedWalkValue",
+    Callback = function(val)
+        Config.SpeedWalk.Speed = val
+    end,
+})
+
+MovementTab:CreateSection("Anti-Aim")
+
+MovementTab:CreateToggle({
+    Name = "Enable Anti-Aim",
+    CurrentValue = Config.AntiAim.Enabled,
+    Flag = "AntiAimEnabled",
+    Callback = function(val)
+        Config.AntiAim.Enabled = val
+    end,
+})
+
+MovementTab:CreateDropdown({
+    Name = "Yaw Mode",
+    Options = { "Spin", "Jitter", "Backward", "Random" },
+    CurrentOption = { Config.AntiAim.YawMode },
+    MultipleOptions = false,
+    Flag = "AntiAimYawMode",
+    Callback = function(options)
+        Config.AntiAim.YawMode = options[1] or "Spin"
+    end,
+})
+
+MovementTab:CreateSlider({
+    Name = "Spin Speed",
+    Range = { 1, 100 },
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = Config.AntiAim.SpinSpeed,
+    Flag = "AntiAimSpinSpeed",
+    Callback = function(val)
+        Config.AntiAim.SpinSpeed = val
+    end,
+})
+
+MovementTab:CreateSlider({
+    Name = "Jitter Angle",
+    Range = { 15, 180 },
+    Increment = 5,
+    Suffix = " deg",
+    CurrentValue = Config.AntiAim.JitterAngle,
+    Flag = "AntiAimJitterAngle",
+    Callback = function(val)
+        Config.AntiAim.JitterAngle = val
+    end,
+})
+
+MovementTab:CreateSlider({
+    Name = "Root Pitch Tilt",
+    Range = { -85, 85 },
+    Increment = 5,
+    Suffix = " deg",
+    CurrentValue = Config.AntiAim.PitchTilt,
+    Flag = "AntiAimPitchTilt",
+    Callback = function(val)
+        Config.AntiAim.PitchTilt = val
+    end,
+})
+
+-- Tab 4: Mobile & Touch Controls
+local MobileTab = Window:CreateTab("Mobile & Touch", 4483362458)
+
+MobileTab:CreateSection("Touchscreen Controls")
+
+MobileTab:CreateToggle({
+    Name = "Enable Mobile Input Mode",
+    CurrentValue = Config.Mobile.Enabled,
+    Flag = "MobileInputEnabled",
+    Callback = function(val)
+        Config.Mobile.Enabled = val
+        if val then
+            Config.FOV.FollowMouse = false
+        end
+    end,
+})
+
+MobileTab:CreateToggle({
+    Name = "Show Floating Touch Action Bar",
+    CurrentValue = Config.Mobile.ShowTouchHUD,
+    Flag = "MobileShowTouchHUD",
+    Callback = function(val)
+        Config.Mobile.ShowTouchHUD = val
+        if State.TouchGui then
+            local bar = State.TouchGui:FindFirstChild("TouchActionBar")
+            if bar and bar:IsA("Frame") then
+                bar.Visible = val
+            end
+        end
+    end,
+})
+
+MobileTab:CreateToggle({
+    Name = "Touch AIM Button Hold Mode (Off = Tap Toggle)",
+    CurrentValue = Config.Mobile.TouchAimHoldMode,
+    Flag = "MobileAimHoldMode",
+    Callback = function(val)
+        Config.Mobile.TouchAimHoldMode = val
+        State.TouchAimHeld = false
+        State.AimbotToggled = false
+        UpdateTouchHUDVisuals()
+    end,
+})
+
+MobileTab:CreateSlider({
+    Name = "Touch Bar Scale",
+    Range = { 0.7, 1.6 },
+    Increment = 0.05,
+    Suffix = "x",
+    CurrentValue = Config.Mobile.ButtonScale,
+    Flag = "MobileHUDScale",
+    Callback = function(val)
+        Config.Mobile.ButtonScale = val
+        if State.TouchGui then
+            local bar = State.TouchGui:FindFirstChild("TouchActionBar")
+            local uiScale = bar and bar:FindFirstChild("HUDScale")
+            if uiScale and uiScale:IsA("UIScale") then
+                uiScale.Scale = val
+            end
+        end
+    end,
+})
+
+MobileTab:CreateToggle({
+    Name = "Use GUI FOV Ring (Fix Mobile DPI Offset)",
+    CurrentValue = Config.Mobile.UseGuiFOVFallback,
+    Flag = "MobileGuiFOVFallback",
+    Callback = function(val)
+        Config.Mobile.UseGuiFOVFallback = val
+    end,
+})
+
+-- Tab 5: Desync & Diagnostics
+local DesyncTab = Window:CreateTab("Desync & System", 4483362458)
+
+DesyncTab:CreateSection("Replication Desync")
+
+DesyncTab:CreateToggle({
+    Name = "Enable Desync",
+    CurrentValue = Config.Desync.Enabled,
+    Flag = "DesyncEnabled",
+    Callback = function(val)
+        if val and Config.Desync.Mode == "FFlag Replication" and not Capabilities.SetFFlag then
+            Rayfield:Notify({
+                Title = "FFlag Unavailable",
+                Content = "Executor lacks setfflag; switch to CFrame Blink or Velocity Spoof.",
+                Duration = 4,
+            })
+        end
+        Config.Desync.Enabled = val
+        UpdateTouchHUDVisuals()
+    end,
+})
+
+DesyncTab:CreateDropdown({
+    Name = "Desync Mode",
+    Options = { "CFrame Blink", "Velocity Spoof", "FFlag Replication" },
+    CurrentOption = { Config.Desync.Mode },
+    MultipleOptions = false,
+    Flag = "DesyncMode",
+    Callback = function(options)
+        Config.Desync.Mode = options[1] or "CFrame Blink"
+    end,
+})
+
+DesyncTab:CreateSlider({
+    Name = "CFrame Blink Range",
+    Range = { 1, 25 },
+    Increment = 0.5,
+    Suffix = " studs",
+    CurrentValue = Config.Desync.OffsetRange,
+    Flag = "DesyncOffsetRange",
+    Callback = function(val)
+        Config.Desync.OffsetRange = val
+    end,
+})
+
+DesyncTab:CreateSlider({
+    Name = "Vertical Blink Offset",
+    Range = { -10, 10 },
+    Increment = 0.5,
+    Suffix = " studs",
+    CurrentValue = Config.Desync.VerticalOffset,
+    Flag = "DesyncVerticalOffset",
+    Callback = function(val)
+        Config.Desync.VerticalOffset = val
+    end,
+})
+
+DesyncTab:CreateSlider({
+    Name = "Velocity Spoof Magnitude",
+    Range = { 50, 1000 },
+    Increment = 10,
+    Suffix = " st/s",
+    CurrentValue = Config.Desync.VelocityMagnitude,
+    Flag = "DesyncVelocityMag",
+    Callback = function(val)
+        Config.Desync.VelocityMagnitude = val
+    end,
+})
+
+DesyncTab:CreateSection("Runtime Status & Teardown")
+
+DesyncTab:CreateParagraph({
+    Title = "Detected Platform & Executor APIs",
+    Content = string.format(
+        "Touch Device: %s | Drawing: %s | __namecall Hook: %s | setfflag: %s",
+        tostring(IsTouchDevice),
+        tostring(Capabilities.Drawing),
+        tostring(CanHookNamecall),
+        tostring(Capabilities.SetFFlag)
+    ),
+})
+
+DesyncTab:CreateButton({
+    Name = "Unload & Restore All",
+    Callback = function()
+        UnloadSuite()
+        Rayfield:Destroy()
+    end,
+})
